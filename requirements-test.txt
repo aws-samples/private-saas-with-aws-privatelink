@@ -1,0 +1,3 @@
+checkov
+cfn-lint
+urllib3[secure]<2

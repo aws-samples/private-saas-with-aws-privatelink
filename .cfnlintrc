@@ -1,0 +1,6 @@
+templates:
+- test_template.yml
+- privatelink_nlb_alb/cloudformation/privatelink_nlb_alb.yml
+- privatelink_nlb_apigw/cloudformation/privatelink_nlb_apigw.yml
+include_checks:
+- I

@@ -1,0 +1,603 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: Provider Test Template
+
+Parameters:
+  VpcId:
+    Type: "AWS::EC2::VPC::Id"
+    Description: VPC ID
+  PublicSubnetIds:
+    Type: "List<AWS::EC2::Subnet::Id>"
+    Description: Public Subnet Ids for the ALB
+  PrivateSubnetIds:
+    Type: "List<AWS::EC2::Subnet::Id>"
+    Description: Private Subnet Ids for the private API Gateway
+  HostedZoneId:
+    Type: "AWS::Route53::HostedZone::Id"
+    Description: Hosted Zone ID
+  DomainName:
+    Type: String
+    Description: Base Domain Name
+
+Globals:
+  Function:
+    Architectures:
+      - arm64
+    Handler: index.lambda_handler
+    MemorySize: 128 # megabytes
+    Timeout: 5 # seconds
+
+Resources:
+  LoadBalancerSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W2
+            reason: "Ignoring world access, permissible on ELB"
+          - id: W5
+            reason: "Ignoring egress all access"
+          - id: W9
+            reason: "Ignoring ingress not /32"
+          - id: W40
+            reason: "Ignoring all protocols"
+    Properties:
+      GroupDescription: Load Balancer SG
+      SecurityGroupEgress:
+        - CidrIp: "0.0.0.0/0"
+          Description: Allow any to Internet
+          IpProtocol: "-1"
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          Description: Allow 80/tcp from Internet
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+        - CidrIp: "0.0.0.0/0"
+          Description: Allow 443/tcp from Internet
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !Ref VpcId
+
+  LoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W52
+            reason: "Ignoring access logging"
+    Properties:
+      IpAddressType: ipv4
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+        - Key: routing.http.x_amzn_tls_version_and_cipher_suite.enabled
+          Value: "true"
+        - Key: routing.http.xff_client_port.enabled
+          Value: "true"
+        - Key: routing.http2.enabled
+          Value: "true"
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      Type: application
+    
+  TargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      TargetType: lambda
+
+  FunctionLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Ignoring KMS key"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Function}"
+      RetentionInDays: 3
+      Tags:
+        - Key: "aws-cloudformation:stack-name"
+          Value: !Ref "AWS::StackName"
+        - Key: "aws-cloudformation:stack-id"
+          Value: !Ref "AWS::StackId"
+        - Key: "aws-cloudformation:logical-id"
+          Value: FunctionLogGroup
+
+  FunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: !Sub "lambda.${AWS::URLSuffix}"
+          Action: "sts:AssumeRole"
+      Description: !Sub "DO NOT DELETE - Used by Lambda. Created by CloudFormation ${AWS::StackId}"
+      Tags:
+        - Key: "aws-cloudformation:stack-name"
+          Value: !Ref "AWS::StackName"
+        - Key: "aws-cloudformation:stack-id"
+          Value: !Ref "AWS::StackId"
+        - Key: "aws-cloudformation:logical-id"
+          Value: FunctionRole
+
+  CloudWatchLogsPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: CloudWatchLogs
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !GetAtt FunctionLogGroup.Arn
+      Roles:
+        - !Ref FunctionRole
+
+  Function:
+    Type: "AWS::Serverless::Function"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Ignoring CloudWatch"
+          - id: W89
+            reason: "Ignoring VPC"
+          - id: W92
+            reason: "Ignoring Reserved Concurrency"
+    Properties:
+      Description: !Sub "${AWS::StackName} Demo Function"
+      InlineCode: |-
+        exports.lambda_handler = async(event, context) => {
+          console.log(event);
+
+          const data = {
+            event
+          };
+
+          const response = {
+            statusCode: 200,
+            isBase64Encoded: false,
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(data, null, 2)
+          };
+          return response;
+        }
+      Role: !GetAtt FunctionRole.Arn
+      Runtime: nodejs18.x
+
+  FunctionPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt Function.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: !Sub "elasticloadbalancing.${AWS::URLSuffix}"
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:${TargetGroup.TargetGroupFullName}"
+
+  TargetFunctionLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Ignoring KMS key"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TargetFunction}"
+      RetentionInDays: 3
+      Tags:
+        - Key: "aws-cloudformation:stack-name"
+          Value: !Ref "AWS::StackName"
+        - Key: "aws-cloudformation:stack-id"
+          Value: !Ref "AWS::StackId"
+        - Key: "aws-cloudformation:logical-id"
+          Value: TargetFunctionLogGroup
+
+  TargetFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: !Sub "lambda.${AWS::URLSuffix}"
+          Action: "sts:AssumeRole"
+      Description: !Sub "DO NOT DELETE - Used by Lambda. Created by CloudFormation ${AWS::StackId}"
+      Policies:
+        - PolicyName: RegisterTargetPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "elasticloadbalancing:RegisterTargets"
+                  - "elasticloadbalancing:DeregisterTargets"
+                Resource: !Ref TargetGroup
+      Tags:
+        - Key: "aws-cloudformation:stack-name"
+          Value: !Ref "AWS::StackName"
+        - Key: "aws-cloudformation:stack-id"
+          Value: !Ref "AWS::StackId"
+        - Key: "aws-cloudformation:logical-id"
+          Value: TargetFunctionRole
+
+  TargetCloudWatchLogsPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: CloudWatchLogs
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !GetAtt TargetFunctionLogGroup.Arn
+      Roles:
+        - !Ref TargetFunctionRole
+
+  TargetFunction:
+    Type: "AWS::Serverless::Function"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Ignoring CloudWatch"
+          - id: W89
+            reason: "Ignoring VPC"
+          - id: W92
+            reason: "Ignoring Reserved Concurrency"
+    Properties:
+      Description: ALB Target Registration Function  
+      InlineCode: |-
+        import logging
+
+        import boto3
+        import cfnresponse
+
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        client = boto3.client("elbv2")
+
+        def lambda_handler(event, context):
+          response_data = {}
+          status = cfnresponse.SUCCESS
+
+          target_group_arn = event.get("ResourceProperties", {}).get("TargetGroupArn")
+          function_arn = event.get("ResourceProperties", {}).get("FunctionArn")
+          targets = [{"Id": function_arn}]
+
+          try:
+            if event["RequestType"] in ("Create", "Update"):
+              client.register_targets(TargetGroupArn=target_group_arn, Targets=targets)
+            elif event["RequestType"] == "Delete":
+              client.deregister_targets(TargetGroupArn=target_group_arn, Targets=targets)
+          except Exception as error:
+            logger.exception(error)
+            response_data["Message"] = str(error)
+            status = cfnresponse.FAILED
+          else:
+            response_data["Message"] = "success"
+            status = cfnresponse.SUCCESS
+          finally:
+            cfnresponse.send(event, context, status, response_data)
+      Role: !GetAtt TargetFunctionRole.Arn
+      Runtime: python3.10
+
+  RegisterTarget:
+    DependsOn:
+      - FunctionPermission
+      - TargetCloudWatchLogsPolicy
+    Type: "Custom::RegisterTarget"
+    Properties:
+      ServiceToken: !GetAtt TargetFunction.Arn
+      TargetGroupArn: !Ref TargetGroup
+      FunctionArn: !GetAtt Function.Arn
+
+  Certificate:
+    Type: "AWS::CertificateManager::Certificate"
+    Properties:
+      DomainName: !Sub "alb.${DomainName}"
+      DomainValidationOptions:
+        - DomainName: !Sub "alb.${DomainName}"
+          HostedZoneId: !Ref HostedZoneId
+      ValidationMethod: DNS
+
+  HttpListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W56
+            reason: "Ignoring HTTP"
+    Properties:
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Host: "#{host}"
+            Path: "/#{path}"
+            Protocol: HTTPS
+            Port: 443
+            Query: "#{query}"
+            StatusCode: "HTTP_301"
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  HttpsListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+  RecordSet:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        EvaluateTargetHealth: true
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "alb.${DomainName}"
+      Type: A
+  
+######################## API Gateway ######################
+
+  VpcEndpointSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W2
+            reason: "Ignoring world access, permissible on ELB"
+          - id: W5
+            reason: "Ignoring egress all access"
+          - id: W9
+            reason: "Ignoring ingress not /32"
+          - id: W40
+            reason: "Ignoring all protocols"
+    Properties:
+      GroupDescription: VPC Endpoint SG
+      SecurityGroupEgress:
+        - CidrIp: "0.0.0.0/0"
+          Description: Allow any to Internet
+          IpProtocol: "-1"
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          Description: Allow 443/tcp from Internet
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !Ref VpcId
+
+  ApiGatewayRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: !Sub "apigateway.${AWS::URLSuffix}"
+          Action: "sts:AssumeRole"
+      Description: !Sub "DO NOT DELETE - Used by API Gateway. Created by CloudFormation ${AWS::StackId}"
+      Policies:
+        - PolicyName: Lambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource: !GetAtt Function.Arn
+      Tags:
+        - Key: "aws-cloudformation:stack-name"
+          Value: !Ref "AWS::StackName"
+        - Key: "aws-cloudformation:stack-id"
+          Value: !Ref "AWS::StackId"
+        - Key: "aws-cloudformation:logical-id"
+          Value: ApiGatewayRole
+
+  VpcEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      PrivateDnsEnabled: true
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.execute-api"
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      SubnetIds: !Ref PrivateSubnetIds
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+
+  PrivateApi:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Description: Sample Private API Gateway
+      DisableExecuteApiEndpoint: true
+      EndpointConfiguration:
+        Types:
+          - PRIVATE
+        VpcEndpointIds:
+          - !Ref VpcEndpoint
+      MinimumCompressionSize: 860 # bytes
+      Name: !Ref "AWS::StackName"
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "execute-api:/*"
+          - Effect: Deny
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "execute-api:/*"
+            Condition:
+              StringNotEquals:
+                "aws:SourceVpce": !Ref VpcEndpoint
+  
+  ProxyResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt PrivateApi.RootResourceId
+      RestApiId: !Ref PrivateApi
+      PathPart: "{proxy+}"
+
+  RootMethod:
+    Type: "AWS::ApiGateway::Method"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W59
+            reason: "Ignoring no authorization type"
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        ConnectionType: INTERNET
+        IntegrationHttpMethod: POST
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 2000
+        Type: AWS_PROXY
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Function.Arn}/invocations"
+      ResourceId: !GetAtt PrivateApi.RootResourceId
+      RestApiId: !Ref PrivateApi
+
+  ProxyMethod:
+    Type: "AWS::ApiGateway::Method"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W59
+            reason: "Ignoring no authorization type"
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        CacheKeyParameters:
+          - "method.request.path.proxy"
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        ConnectionType: INTERNET
+        IntegrationHttpMethod: POST
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 2000
+        RequestParameters:
+          integration.request.path.proxy: "method.request.path.proxy"
+        Type: AWS_PROXY
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Function.Arn}/invocations"
+      RequestParameters:
+        method.request.path.proxy: true
+      ResourceId: !Ref ProxyResource
+      RestApiId: !Ref PrivateApi
+  
+  Deployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DependsOn:
+      - RootMethod
+      - ProxyMethod
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W68
+            reason: "Ignoring usage plan"
+    Properties:
+      RestApiId: !Ref PrivateApi
+
+  Stage:
+    Type: "AWS::ApiGateway::Stage"
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W69
+            reason: "Ignoring access logs"
+          - id: W64
+            reason: "Ignoring usage plan"
+    Properties:
+      DeploymentId: !Ref Deployment
+      Description: !Sub "${AWS::StackName} v0"
+      RestApiId: !Ref PrivateApi
+      StageName: v0
+
+  ApiGatewayFunctionPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt Function.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: !Sub "apigateway.${AWS::URLSuffix}"
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateApi}/*/*/*"
+
+  ApiCertificate:
+    Type: "AWS::CertificateManager::Certificate"
+    Properties:
+      DomainName: !Sub "apigw.${DomainName}"
+      DomainValidationOptions:
+        - DomainName: !Sub "apigw.${DomainName}"
+          HostedZoneId: !Ref HostedZoneId
+      ValidationMethod: DNS
+
+  ApiDomainName:
+    Type: "AWS::ApiGateway::DomainName"
+    Properties:
+      DomainName: !Sub "apigw.${DomainName}"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      RegionalCertificateArn: !Ref ApiCertificate
+      SecurityPolicy: TLS_1_2
+
+  BasePathMapping:
+    Type: "AWS::ApiGateway::BasePathMapping"
+    DependsOn: ApiDomainName
+    Properties:
+      DomainName: !Sub "apigw.${DomainName}"
+      RestApiId: !Ref PrivateApi
+      Stage: !Ref Stage
+
+Outputs:
+  LoadBalancerArn:
+    Description: Load Balancer ARN
+    Value: !Ref LoadBalancer
+  LoadBalancerDNSName:
+    Description: Load Balancer Hostname
+    Value: !GetAtt LoadBalancer.DNSName
+  LoadBalancerURL:
+    Description: Public Load Balancer URL
+    Value: !Sub "https://alb.${DomainName}/"
+  ApiGatewayDNSName:
+    Description: Private API Gateway Hostname
+    Value: !Sub "${PrivateApi}-${VpcEndpoint}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+  ApiGatewayURL:
+    Description: Private API Gateway URL
+    Value: !Sub "https://${PrivateApi}-${VpcEndpoint}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${Stage}"
+  VpcEndpointId:
+    Description: Private API Gateway VPC Endpoint ID
+    Value: !Ref VpcEndpoint

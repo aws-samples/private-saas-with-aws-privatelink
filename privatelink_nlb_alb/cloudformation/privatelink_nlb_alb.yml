@@ -1,0 +1,268 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Provider NLB->ALB Template
+
+Parameters:
+  VpcId:
+    Type: "AWS::EC2::VPC::Id"
+    Description: VPC hosting the ALB
+  SubnetIds:
+    Type: "List<AWS::EC2::Subnet::Id>"
+    Description: Private Subnet Ids for NLB. These should be the same AZs the ALB is using.
+  ApplicationLoadBalancerArn:
+    Type: String
+    Description: ALB ARN
+  HostedZoneId:
+    Type: "AWS::Route53::HostedZone::Id"
+    Description: Hosted Zone ID
+  DomainName:
+    Type: String
+    Description: Domain Name
+
+Resources:
+  LoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W52
+            reason: "Ignoring access logging"
+    Properties:
+      IpAddressType: ipv4
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: "true"
+      Scheme: internal
+      Subnets: !Ref SubnetIds
+      Type: network
+    
+  TargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      HealthCheckProtocol: HTTPS
+      IpAddressType: ipv4
+      Port: 443
+      Protocol: TCP
+      Targets:
+        - Id: !Ref ApplicationLoadBalancerArn
+          Port: 443
+      TargetType: alb
+      VpcId: !Ref VpcId
+
+  Listener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: TCP
+
+  NotificationTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: VPC Endpoint Notifications
+      KmsMasterKeyId: "alias/aws/sns"
+
+  NotificationTopicPolicy:
+    Type: "AWS::SNS::TopicPolicy"
+    Properties:
+      PolicyDocument:
+        Id: VPCE
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "vpce.${AWS::URLSuffix}"
+            Action: "sns:Publish"
+            Resource: !Ref NotificationTopic
+            Condition:
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc-endpoint-service/${VPCEndpointService}"
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+      Topics:
+        - !Ref NotificationTopic
+
+  VPCEndpointService:
+    Type: "AWS::EC2::VPCEndpointService"
+    Properties:
+      AcceptanceRequired: false
+      ContributorInsightsEnabled: false
+      NetworkLoadBalancerArns:
+        - !Ref LoadBalancer
+  
+  VPCEndpointConnectionNotification:
+    Type: "AWS::EC2::VPCEndpointConnectionNotification"
+    Properties:
+      ConnectionEvents:
+        - Accept
+        - Connect
+        - Delete
+        - Reject
+      ConnectionNotificationArn: !Ref NotificationTopic
+      ServiceId: !Ref VPCEndpointService
+  
+  PrivateDnsFunctionLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Ignoring KMS key"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PrivateDnsFunction}"
+      RetentionInDays: 3
+      Tags:
+        - Key: "aws-cloudformation:stack-name"
+          Value: !Ref "AWS::StackName"
+        - Key: "aws-cloudformation:stack-id"
+          Value: !Ref "AWS::StackId"
+        - Key: "aws-cloudformation:logical-id"
+          Value: PrivateDnsFunctionLogGroup
+
+  PrivateDnsFunctionRole:
+    Type: "AWS::IAM::Role"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Ignoring wildcard resource"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: !Sub "lambda.${AWS::URLSuffix}"
+          Action: "sts:AssumeRole"
+      Description: !Sub "DO NOT DELETE - Used by Lambda. Created by CloudFormation ${AWS::StackId}"
+      Policies:
+        - PolicyName: RegisterTargetPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ec2:ModifyVpcEndpointServiceConfiguration"
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc-endpoint-service/${VPCEndpointService}"
+              - Effect: Allow
+                Action: "ec2:DescribeVpcEndpointServiceConfigurations"
+                Resource: "*"
+      Tags:
+        - Key: "aws-cloudformation:stack-name"
+          Value: !Ref "AWS::StackName"
+        - Key: "aws-cloudformation:stack-id"
+          Value: !Ref "AWS::StackId"
+        - Key: "aws-cloudformation:logical-id"
+          Value: PrivateDnsFunctionRole
+
+  CloudWatchLogsPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: CloudWatchLogs
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !GetAtt PrivateDnsFunctionLogGroup.Arn
+      Roles:
+        - !Ref PrivateDnsFunctionRole
+
+  PrivateDnsFunction:
+    Type: "AWS::Lambda::Function"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Ignoring CloudWatch"
+          - id: W89
+            reason: "Ignoring VPC"
+          - id: W92
+            reason: "Ignoring Reserved Concurrency"
+    Properties:
+      Architectures:
+        - arm64
+      Description: VPC Endpoint Private DNS Function  
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |-
+          import logging
+
+          import boto3
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          client = boto3.client("ec2")
+
+          def lambda_handler(event, context):
+            response_data = {}
+            status = cfnresponse.SUCCESS
+
+            service_id = event.get("ResourceProperties", {}).get("ServiceId")
+            domain_name = event.get("ResourceProperties", {}).get("DomainName")
+
+            try:
+              if event["RequestType"] in ("Create", "Update"):
+                client.modify_vpc_endpoint_service_configuration(ServiceId=service_id, PrivateDnsName=domain_name)
+                paginator = client.get_paginator("describe_vpc_endpoint_service_configurations")
+                page_iterator = paginator.paginate(ServiceIds=[service_id])
+                for page in page_iterator:
+                  for service in page.get("ServiceConfigurations", []):
+                    response_data = service.get("PrivateDnsNameConfiguration", {})
+              elif event["RequestType"] == "Delete":
+                client.modify_vpc_endpoint_service_configuration(ServiceId=service_id, RemovePrivateDnsName=True)
+            except Exception as error:
+              logger.exception(error)
+              response_data["Message"] = str(error)
+              status = cfnresponse.FAILED
+            else:
+              response_data["Message"] = "success"
+              status = cfnresponse.SUCCESS
+            finally:
+              cfnresponse.send(event, context, status, response_data)
+      MemorySize: 128 # megabytes
+      Role: !GetAtt PrivateDnsFunctionRole.Arn
+      Runtime: python3.10
+      Timeout: 10 # seconds
+
+  PrivateDns:
+    DependsOn: CloudWatchLogsPolicy
+    Type: "Custom::PrivateDns"
+    Properties:
+      ServiceToken: !GetAtt PrivateDnsFunction.Arn
+      ServiceId: !Ref VPCEndpointService
+      DomainName: !Ref DomainName
+  
+  RecordSet:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "${PrivateDns.Name}.${DomainName}"
+      ResourceRecords:
+        - !Sub '"${PrivateDns.Value}"'
+      TTL: "1800"
+      Type: !GetAtt PrivateDns.Type
+
+Outputs:
+  VpcEndpointServiceId:
+    Description: VPC Endpoint Service ID
+    Value: !Ref VPCEndpointService
+  VpcEndpointServiceName:
+    Description: VPC Endpoint Service Name
+    Value: !Sub "com.amazonaws.vpce.${AWS::Region}.${VPCEndpointService}"
+  PrivateDnsName:
+    Description: Private DNS Name
+    Value: !Ref DomainName
