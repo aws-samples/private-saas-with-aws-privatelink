@@ -23,6 +23,33 @@ Parameters:
     Description: Domain Name
 
 Resources:
+  LoadBalancerSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W2
+            reason: "Ignoring world access, permissible on ELB"
+          - id: W5
+            reason: "Ignoring egress all access"
+          - id: W9
+            reason: "Ignoring ingress not /32"
+          - id: W40
+            reason: "Ignoring all protocols"
+    Properties:
+      GroupDescription: Allow TLS inbound traffic
+      SecurityGroupEgress:
+        - CidrIp: "0.0.0.0/0"
+          Description: Allow all traffic to anywhere
+          IpProtocol: "-1"
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          Description: Allow 443/tcp from anywhere
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !Ref VpcId
+
   LoadBalancer:
     Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
     DeletionPolicy: Retain
@@ -37,6 +64,8 @@ Resources:
       LoadBalancerAttributes:
         - Key: deletion_protection.enabled
           Value: "true"
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
       Scheme: internal
       Subnets: !Ref SubnetIds
       Type: network
@@ -235,7 +264,7 @@ Resources:
               cfnresponse.send(event, context, status, response_data)
       MemorySize: 128 # megabytes
       Role: !GetAtt PrivateDnsFunctionRole.Arn
-      Runtime: python3.10
+      Runtime: python3.11
       Timeout: 10 # seconds
 
   PrivateDns:

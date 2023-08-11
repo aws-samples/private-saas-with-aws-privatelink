@@ -1,3 +1,27 @@
+resource "aws_security_group" "allow_tls" {
+  name        = "allow_tls"
+  description = "Allow TLS inbound traffic"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    description      = "Allow 443/tcp from anywhere"
+    from_port        = 443
+    to_port          = 443
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  egress {
+    description      = "Allow all traffic to anywhere"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+}
+
 resource "aws_lb" "this" {
   #checkov:skip=CKV_AWS_152:Cross-zone load balancing is disabled
   #checkov:skip=CKV_AWS_91:Disabled access logging
@@ -8,7 +32,8 @@ resource "aws_lb" "this" {
 
   enable_deletion_protection = true
 
-  subnets = var.subnet_ids
+  security_groups = [aws_security_group.allow_tls.id]
+  subnets         = var.subnet_ids
 }
 
 resource "aws_lb_target_group" "this" {

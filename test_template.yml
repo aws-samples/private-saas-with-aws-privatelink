@@ -301,7 +301,7 @@ Resources:
           finally:
             cfnresponse.send(event, context, status, response_data)
       Role: !GetAtt TargetFunctionRole.Arn
-      Runtime: python3.10
+      Runtime: python3.11
 
   RegisterTarget:
     DependsOn:
